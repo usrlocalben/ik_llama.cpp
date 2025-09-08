@@ -36,6 +36,7 @@
 #include <memory>
 #include <random>
 #include <algorithm>
+#include <string_view>
 #include <src/llama-impl.h>
 #ifdef SQLITE3_MODERN_CPP_SUPPORT
 #include <sqlite_modern_cpp.h>
@@ -56,7 +57,40 @@ using json = nlohmann::ordered_json;
 bool server_verbose = false;
 bool server_log_json = true;
 
+constexpr int spool_match_margin = 100;
 
+static bool ends_with(std::string_view str, std::string_view suffix)
+{
+    return str.size() >= suffix.size() && str.compare(str.size()-suffix.size(), suffix.size(), suffix) == 0;
+}
+
+static int64_t gen_spool_id() {
+    // 16 digit random key
+    static std::mt19937_64 gen(std::random_device{}());
+    static std::uniform_int_distribution<int64_t> dist(
+            1000'0000'0000'0000LL,
+            9999'9999'9999'9999LL);
+    return dist(gen);
+}
+
+int64_t to_spool_id(const std::filesystem::directory_entry& f) {
+    std::stringstream keytmp;
+    for (auto ch : f.path().filename().string()) {
+        if (isdigit(ch)) {
+            keytmp << ch;
+        } else {
+            break;
+        }
+    }
+    return stoll(keytmp.str());
+}
+
+static std::string read_file(const std::filesystem::directory_entry& f) {
+    std::string data(f.file_size(), '\0');
+    std::ifstream file(f.path());
+    file.read(&data[0], f.file_size());
+    return data;
+}
 
 enum stop_type {
     STOP_TYPE_NONE,
@@ -2407,6 +2441,52 @@ struct server_context {
                         break;
                     }
 
+                    {
+                        std::string req_prompt;
+                        if (task.data.contains("prompt") && task.data.at("prompt").is_string()) {
+                            req_prompt = json_value(task.data, "prompt", std::string());
+                        }
+
+                        const int64_t t_1 = ggml_time_us();
+                        int64_t best_cpl = -1;
+                        std::filesystem::directory_entry best_entry;
+                        for (const auto& entry : std::filesystem::directory_iterator(params.slot_save_path)) {
+                            if (entry.is_regular_file() &&
+                                    entry.file_size() > 0 &&
+                                    ends_with(entry.path().filename().string(), ".text")) {
+                                int64_t cpl = common_part(read_file(entry), req_prompt);
+                                LOG_VERBOSE("spool candidate", {{"fn", entry.path().filename().string()}, {"cpl", cpl}});
+                                if (best_cpl < cpl) {
+                                    best_cpl = cpl;
+                                    best_entry = entry;
+                                }
+                            }
+                        }
+                        const int64_t t_2 = ggml_time_us();
+                        if (-1 < best_cpl) {
+                            auto spool_id = to_spool_id(best_entry);
+                            LOG_INFO("spool match", {{"best_cpl", best_cpl}, {"spool_id", spool_id}});
+                            std::stringstream spool_fn_data;
+                            spool_fn_data << params.slot_save_path << spool_id << ".data";
+
+                            slot->cache_tokens.resize(slot->n_ctx);
+                            size_t token_count = 0;
+                            size_t nread = llama_state_seq_load_file(ctx, spool_fn_data.str().c_str(), slot->id + 1, slot->cache_tokens.data(), slot->cache_tokens.size(), &token_count);
+                            if (nread == 0) {
+                                LOG_INFO("spool read error", {{"spool_id", spool_id}, {"n_read", 0}});
+                                slot->cache_tokens.resize(0);
+                            }
+                            else {
+                                slot->cache_tokens.resize(token_count);
+                                LOG_INFO("spool load", {{"n_tokens", token_count}});
+                            }
+                        }
+                        const int64_t t_3 = ggml_time_us();
+                        const double t_probe_ms = (t_2 - t_1) / 1000.0;
+                        const double t_load_ms = (t_3 - t_2) / 1000.0;
+                        LOG_INFO("spool load", {{"hit", best_cpl>-1?"y":"n"}, {"t_probe_ms", t_probe_ms}, {"t_load_ms", t_load_ms}});
+                    }
+
                     if (task.data.contains("system_prompt")) {
                         std::string sys_prompt = json_value(task.data, "system_prompt", std::string());
                         system_prompt_set(sys_prompt);
@@ -3240,6 +3320,46 @@ struct server_context {
                 }
 
                 if (!process_token(result, slot)) {
+                    std::string slot_prompt = slot.prompt.get<std::string>();
+
+                    const int64_t t_1 = ggml_time_us();
+                    int64_t spool_id = -1;
+                    for (const auto& entry : std::filesystem::directory_iterator(params.slot_save_path)) {
+                        if (entry.is_regular_file() &&
+                                entry.file_size() > 0 &&
+                                ends_with(entry.path().filename().string(), ".text")) {
+
+                            const auto saved_text = read_file(entry);
+                            int64_t cpl = common_part(saved_text, slot_prompt);
+                            if (saved_text.size() > spool_match_margin &&
+                                    cpl >= saved_text.size() - spool_match_margin) {
+                                // our slot can extend an existing entry
+                                spool_id = to_spool_id(entry);
+                                break;
+                            }
+                        }
+                    }
+                    const int64_t t_2 = ggml_time_us();
+
+                    bool hit = spool_id != -1;
+                    if (spool_id == -1) {
+                        spool_id = gen_spool_id(); }
+
+                    std::stringstream spool_fn_data;
+                    std::stringstream spool_fn_text;
+                    spool_fn_data << params.slot_save_path << spool_id << ".data";
+                    spool_fn_text << params.slot_save_path << spool_id << ".text";
+                    const size_t token_count = slot.cache_tokens.size();
+                    llama_state_seq_save_file(ctx, spool_fn_data.str().c_str(), slot.id + 1, slot.cache_tokens.data(), token_count);
+                    std::ofstream text_out(spool_fn_text.str());
+                    text_out << slot_prompt;
+                    text_out.close();
+
+                    const int64_t t_3 = ggml_time_us();
+                    const double t_probe_ms = (t_2 - t_1) / 1000.0;
+                    const double t_save_ms = (t_3 - t_2) / 1000.0;
+                    LOG_INFO("spool save", {{"extend", hit?"y":"n"}, {"t_probe_ms", t_probe_ms}, {"t_save_ms", t_save_ms}});
+
                     slot.release();
                     slot.print_timings();
                     send_final_response(slot);
