@@ -67,20 +67,25 @@
 #include <cstddef>
 #include <cstdint>
 #include <float.h>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <condition_variable>
+#include <queue>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 #include <sstream>
 
 #ifdef __linux__
+#include <pthread.h>
 #include <sys/mman.h>
 #endif
 
@@ -641,10 +646,337 @@ GGML_CALL static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+enum exps_readahead_role {
+    EXPS_RA_NONE = 0,
+    EXPS_RA_GATE_UP,
+    EXPS_RA_GATE,
+    EXPS_RA_UP,
+    EXPS_RA_DOWN,
+};
+
+static exps_readahead_role exps_readahead_parse_role(const char * name) {
+    if (!name || !strstr(name, "_exps")) return EXPS_RA_NONE;
+    if (strstr(name, "ffn_gate_up_exps")) return EXPS_RA_GATE_UP;
+    if (strstr(name, "ffn_gate_exps"))    return EXPS_RA_GATE;
+    if (strstr(name, "ffn_up_exps"))      return EXPS_RA_UP;
+    if (strstr(name, "ffn_down_exps"))    return EXPS_RA_DOWN;
+    return EXPS_RA_NONE;
+}
+
+static const char * exps_readahead_role_name(exps_readahead_role role) {
+    switch (role) {
+        case EXPS_RA_GATE_UP: return "gate_up";
+        case EXPS_RA_GATE:    return "gate";
+        case EXPS_RA_UP:      return "up";
+        case EXPS_RA_DOWN:    return "down";
+        default:              return "?";
+    }
+}
+
+struct ExpsReadaheadEntry {
+    const void * ptr;
+    size_t size;
+};
+
+struct ExpsReadaheadCache {
+    size_t buf_size = 0;
+    void * slot[2] = {nullptr, nullptr};
+    const void * slot_ptr[2] = {nullptr, nullptr};
+    size_t slot_size[2] = {0, 0};
+    bool slot_ready[2] = {false, false};
+    int last_fill = 1;
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    std::vector<ExpsReadaheadEntry> order;
+    std::unordered_map<const void*, size_t> idx_map;
+    std::mutex mtx;
+    std::condition_variable cv;
+
+    bool alloc(size_t sz) {
+        buf_size = sz;
+        if (sz == 0) return false;
+        if (cudaHostAlloc(&slot[0], sz, cudaHostAllocDefault) != cudaSuccess) {
+            slot[0] = nullptr;
+            return false;
+        }
+        if (cudaHostAlloc(&slot[1], sz, cudaHostAllocDefault) != cudaSuccess) {
+            cudaFreeHost(slot[0]);
+            slot[0] = nullptr;
+            slot[1] = nullptr;
+            return false;
+        }
+        return true;
+    }
+
+    bool grow(size_t sz, std::unique_lock<std::mutex> & lock) {
+        if (sz <= buf_size) return true;
+        for (int s = 0; s < 2; ++s) {
+            if (slot_ptr[s] != nullptr && !slot_ready[s]) {
+                cv.wait(lock, [this, s]{ return slot_ready[s]; });
+            }
+        }
+        void * new0 = nullptr;
+        void * new1 = nullptr;
+        if (cudaHostAlloc(&new0, sz, cudaHostAllocDefault) != cudaSuccess) return false;
+        if (cudaHostAlloc(&new1, sz, cudaHostAllocDefault) != cudaSuccess) {
+            cudaFreeHost(new0);
+            return false;
+        }
+        if (slot[0]) cudaFreeHost(slot[0]);
+        if (slot[1]) cudaFreeHost(slot[1]);
+        slot[0] = new0;
+        slot[1] = new1;
+        buf_size = sz;
+        slot_ptr[0] = slot_ptr[1] = nullptr;
+        slot_ready[0] = slot_ready[1] = false;
+        slot_size[0] = slot_size[1] = 0;
+        last_fill = 1;
+        return true;
+    }
+};
+
+class ExpsReadaheadPool {
+public:
+    explicit ExpsReadaheadPool(int n) : stop_(false) {
+        if (n < 1) n = 1;
+        parse_cores();
+        int nthreads = n;
+        if ((int)cores_.size() > 0 && (int)cores_.size() != nthreads) {
+            nthreads = (int)cores_.size();
+        }
+        for (int i = 0; i < nthreads; ++i) {
+            workers_.emplace_back([this, i] {
+#ifdef __linux__
+                if (i < (int)cores_.size()) {
+                    cpu_set_t mask;
+                    CPU_ZERO(&mask);
+                    CPU_SET(cores_[i], &mask);
+                    pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask);
+                }
+#endif
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(mtx_);
+                        cv_.wait(lock, [this]{ return stop_ || !tasks_.empty(); });
+                        if (stop_ && tasks_.empty()) return;
+                        task = std::move(tasks_.front());
+                        tasks_.pop();
+                    }
+                    task();
+                }
+            });
+        }
+    }
+
+    void enqueue(std::function<void()> t) {
+        {
+            std::unique_lock<std::mutex> lock(mtx_);
+            tasks_.push(std::move(t));
+        }
+        cv_.notify_one();
+    }
+
+    int nthreads() const { return (int)workers_.size(); }
+
+    ~ExpsReadaheadPool() {
+        {
+            std::unique_lock<std::mutex> lock(mtx_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto & t : workers_) if (t.joinable()) t.join();
+    }
+
+private:
+    void parse_cores() {
+#ifdef __linux__
+        if (auto e = getenv("GGML_CUDA_EXPS_READAHEAD_CORES")) {
+            std::stringstream ss(e);
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+                if (!tok.empty()) cores_.push_back(atoi(tok.c_str()));
+            }
+        }
+#endif
+    }
+
+    std::vector<std::thread> workers_;
+    std::queue<std::function<void()>> tasks_;
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    std::vector<int> cores_;
+    bool stop_;
+};
+
+static ExpsReadaheadPool & exps_readahead_pool() {
+    int n = 8;
+    if (auto e = getenv("GGML_CUDA_EXPS_READAHEAD_THREADS")) {
+        n = atoi(e);
+        if (n < 1) n = 1;
+    }
+    static ExpsReadaheadPool pool(n);
+    return pool;
+}
+
+static bool exps_readahead_debug() {
+    static bool v = getenv("GGML_CUDA_EXPS_READAHEAD_DEBUG") != nullptr;
+    return v;
+}
+
+static bool exps_readahead_enabled() {
+    static bool v = getenv("GGML_CUDA_NO_EXPS_READAHEAD") == nullptr;
+    return v;
+}
+
+static ExpsReadaheadCache * exps_readahead_get_cache(int device, exps_readahead_role role) {
+    static std::mutex g_mtx;
+    static std::unordered_map<uint64_t, std::unique_ptr<ExpsReadaheadCache>> table;
+    uint64_t key = ((uint64_t)(uint32_t)device << 48) | ((uint64_t)role << 40);
+    std::lock_guard<std::mutex> lock(g_mtx);
+    auto & c = table[key];
+    if (!c) {
+        c = std::make_unique<ExpsReadaheadCache>();
+    }
+    return c.get();
+}
+
+static bool exps_readahead_copy(int device, exps_readahead_role role, const char * tname, ggml_tensor * tensor, const void * data, size_t size) {
+    ExpsReadaheadCache * c = exps_readahead_get_cache(device, role);
+    if (!c) return false;
+
+    std::unique_lock<std::mutex> lock(c->mtx);
+
+    if (c->slot[0] == nullptr || size > c->buf_size) {
+        size_t need = std::max(size, c->buf_size);
+        if (c->buf_size == 0) {
+            if (!c->alloc(need)) {
+                GGML_CUDA_LOG_WARN("%s: failed to allocate %.2f MiB of pinned memory for exps readahead (dev %d, role %s); falling back to slow copy\n",
+                    __func__, need / (1024.0 * 1024.0), device, exps_readahead_role_name(role));
+                return false;
+            }
+            if (exps_readahead_debug()) {
+                fprintf(stderr, "[exps-ra] alloc dev %d role %s buf %.2f MiB\n",
+                    device, exps_readahead_role_name(role), need / (1024.0 * 1024.0));
+            }
+        } else if (size > c->buf_size) {
+            if (!c->grow(size, lock)) {
+                GGML_CUDA_LOG_WARN("%s: failed to grow pinned buffer to %.2f MiB (dev %d, role %s); falling back to slow copy\n",
+                    __func__, size / (1024.0 * 1024.0), device, exps_readahead_role_name(role));
+                return false;
+            }
+            if (exps_readahead_debug()) {
+                fprintf(stderr, "[exps-ra] grow  dev %d role %s buf %.2f MiB\n",
+                    device, exps_readahead_role_name(role), c->buf_size / (1024.0 * 1024.0));
+            }
+        }
+    }
+
+    auto it = c->idx_map.find(data);
+    if (it == c->idx_map.end()) {
+        c->idx_map[data] = c->order.size();
+        c->order.push_back({data, size});
+        it = c->idx_map.find(data);
+    } else {
+        c->order[it->second].size = size;
+    }
+    size_t cur_idx = it->second;
+
+    int hit_slot = -1;
+    for (int s = 0; s < 2; ++s) {
+        if (c->slot_ptr[s] == data) { hit_slot = s; break; }
+    }
+
+    if (hit_slot >= 0) {
+        c->cv.wait(lock, [&]{ return c->slot_ready[hit_slot]; });
+        CUDA_CHECK(cudaMemcpyAsync((char *)tensor->data, c->slot[hit_slot], size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        c->slot_ptr[hit_slot] = nullptr;
+        c->slot_ready[hit_slot] = false;
+        c->slot_size[hit_slot] = 0;
+        c->hits++;
+        if (exps_readahead_debug()) {
+            fprintf(stderr, "[exps-ra] HIT  dev %d %s role %s size %.2f MiB (hits=%llu misses=%llu)\n",
+                device, tname ? tname : "?", exps_readahead_role_name(role), size / (1024.0 * 1024.0),
+                (unsigned long long)c->hits, (unsigned long long)c->misses);
+        }
+    } else {
+        CUDA_CHECK(cudaMemcpyAsync((char *)tensor->data, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        c->misses++;
+        if (exps_readahead_debug()) {
+            fprintf(stderr, "[exps-ra] MISS dev %d %s role %s size %.2f MiB (hits=%llu misses=%llu)\n",
+                device, tname ? tname : "?", exps_readahead_role_name(role), size / (1024.0 * 1024.0),
+                (unsigned long long)c->hits, (unsigned long long)c->misses);
+        }
+    }
+
+    size_t next_idx = (cur_idx + 1 < c->order.size()) ? cur_idx + 1 : 0;
+    const void * next_ptr = c->order[next_idx].ptr;
+    size_t next_size = c->order[next_idx].size;
+    if (next_ptr == data) {
+        return true;
+    }
+
+    int fill_target = (hit_slot >= 0) ? (hit_slot ^ 1) : (c->last_fill ^ 1);
+    if (hit_slot < 0) c->last_fill = fill_target;
+
+    bool skip = false;
+    for (int s = 0; s < 2; ++s) {
+        if (c->slot_ptr[s] == next_ptr) { skip = true; break; }
+    }
+    if (!skip && c->slot_ptr[fill_target] != nullptr && !c->slot_ready[fill_target]) {
+        skip = true;
+    }
+    if (skip) {
+        return true;
+    }
+
+    c->slot_ptr[fill_target] = next_ptr;
+    c->slot_ready[fill_target] = false;
+    c->slot_size[fill_target] = next_size;
+    void * dst = c->slot[fill_target];
+
+    int pool_n = exps_readahead_pool().nthreads();
+    size_t nchunks = (size_t)pool_n;
+    const size_t min_chunk = 4ULL * 1024 * 1024;
+    if (nchunks > 1 && next_size / nchunks < min_chunk) {
+        nchunks = std::max<size_t>(1, next_size / min_chunk);
+    }
+    if (nchunks < 1) nchunks = 1;
+
+    auto counter = std::make_shared<std::atomic<int>>((int)nchunks);
+    ExpsReadaheadCache * cp = c;
+    for (size_t t = 0; t < nchunks; ++t) {
+        size_t off = (next_size * t) / nchunks;
+        size_t len = (next_size * (t + 1)) / nchunks - off;
+        exps_readahead_pool().enqueue([cp, fill_target, dst, next_ptr, off, len, counter] {
+            memcpy((char *)dst + off, (const char *)next_ptr + off, len);
+            if (counter->fetch_sub(1) == 1) {
+                std::lock_guard<std::mutex> lk(cp->mtx);
+                cp->slot_ready[fill_target] = true;
+                cp->cv.notify_all();
+            }
+        });
+    }
+
+    return true;
+}
+
 GGML_CALL static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+
+    if (offset == 0 && exps_readahead_enabled()) {
+        exps_readahead_role role = exps_readahead_parse_role(tensor->name);
+        if (role != EXPS_RA_NONE) {
+            if (exps_readahead_copy(ctx->device, role, tensor->name, tensor, data, size)) {
+                return;
+            }
+        }
+    }
+
     CUDA_CHECK(cudaMemcpyAsync((char *)tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }

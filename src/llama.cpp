@@ -8128,7 +8128,7 @@ struct llama_context * llama_init_from_model(
         }
     }
 
-    if (params.only_active_experts) {
+    if (false) { //params.only_active_experts) {
         LLAMA_LOG_INFO("%s: enabling only_active_experts scheduling\n", __func__);
         ggml_backend_sched_set_only_active_experts(ctx->sched, true);
     }
