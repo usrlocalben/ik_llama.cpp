@@ -663,6 +663,29 @@ static exps_readahead_role exps_readahead_parse_role(const char * name) {
     return EXPS_RA_NONE;
 }
 
+static int exps_readahead_parse_layer(const char * name) {
+    const char * blk = strstr(name, "blk.");
+    if (!blk) return -1;
+    blk += 4;
+    char * end;
+    long layer = strtol(blk, &end, 10);
+    if (end == blk || *end != '.') return -1;
+    if (layer < 0 || layer > 9999) return -1;
+    return (int)layer;
+}
+
+static bool exps_readahead_layer_in_range(int layer) {
+    static int min_layer = [] {
+        const char * e = getenv("GGML_CUDA_EXPS_READAHEAD_MIN_LAYER");
+        return e ? atoi(e) : 0;
+    }();
+    static int max_layer = [] {
+        const char * e = getenv("GGML_CUDA_EXPS_READAHEAD_MAX_LAYER");
+        return e ? atoi(e) : INT_MAX;
+    }();
+    return layer >= min_layer && layer < max_layer;
+}
+
 static const char * exps_readahead_role_name(exps_readahead_role role) {
     switch (role) {
         case EXPS_RA_GATE_UP: return "gate_up";
@@ -918,6 +941,12 @@ static bool exps_readahead_copy(int device, exps_readahead_role role, const char
         return true;
     }
 
+    if (next_size > c->buf_size) {
+        if (!c->grow(next_size, lock)) {
+            return true;
+        }
+    }
+
     int fill_target = (hit_slot >= 0) ? (hit_slot ^ 1) : (c->last_fill ^ 1);
     if (hit_slot < 0) c->last_fill = fill_target;
 
@@ -970,7 +999,7 @@ GGML_CALL static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t 
 
     if (offset == 0 && exps_readahead_enabled()) {
         exps_readahead_role role = exps_readahead_parse_role(tensor->name);
-        if (role != EXPS_RA_NONE) {
+        if (role != EXPS_RA_NONE && exps_readahead_layer_in_range(exps_readahead_parse_layer(tensor->name))) {
             if (exps_readahead_copy(ctx->device, role, tensor->name, tensor, data, size)) {
                 return;
             }
