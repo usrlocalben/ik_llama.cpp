@@ -13,6 +13,7 @@ enum llm_expert_gating_func_type {
     LLM_EXPERT_GATING_FUNC_SOFTMAX               = 1,
     LLM_EXPERT_GATING_FUNC_SIGMOID               = 2,
     LLM_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT = 3,
+    LLM_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS  = 4,
 };
 
 struct llama_hparams {
@@ -23,6 +24,7 @@ struct llama_hparams {
     uint32_t n_vocab;
     uint32_t n_ctx_train; // context size the model was trained on
     uint32_t n_embd;
+    uint32_t n_embd_out = 0;
     uint32_t n_layer;
     int32_t n_layer_kv_from_start = -1; // if non-negative, the first n_layer_kv_from_start layers have KV cache
     uint32_t n_rot;
@@ -135,11 +137,18 @@ struct llama_hparams {
     uint32_t mhc_num_stream    = 1;
     uint32_t mhc_recur_norm    = 0;
     uint32_t param_sink_number = 0;
-    // openPangu DSA/SWA schedule: per-layer sliding window (0 = DSA layer, full causal
-    // attention over the indexer's top-k selection). The NextN/MTP layers carry their own
-    // (larger) window, applied when the graph is built with an MTP op type.
+    // window used by the NextN/MTP layers in place of n_swa
     uint32_t n_swa_mtp = 0;
-    std::array<uint32_t, LLAMA_MAX_LAYERS> openpangu_window = {};
+
+    // DeepSeek-V4
+    uint32_t dsv4_o_group_count     = 0;
+    uint32_t dsv4_o_lora_rank       = 0;
+    uint32_t dsv4_hc_mult           = 0;
+    uint32_t dsv4_hc_sinkhorn_iters = 0;
+    uint32_t dsv4_hash_layer_count  = 0;
+    float    dsv4_compress_rope_base = 0.0f;
+    float    dsv4_hc_eps             = 0.0f;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios = {};
 
 	// qwen3vl deepstack
     uint32_t n_deepstack_layers = 0;
@@ -160,6 +169,7 @@ struct llama_hparams {
     uint32_t dflash_n_target_layers = 0;
     uint32_t dflash_target_layer_ids[8] = {};
     float    dflash_backbone_rotary_base = 0.0f;
+    bool     dflash_laguna = false;
 
     // needed by encoder-decoder models (e.g. T5, FLAN-T5)
     // ref: https://github.com/ggerganov/llama.cpp/pull/8141
@@ -184,6 +194,7 @@ struct llama_hparams {
         if (this->dflash_mask_token_id != other.dflash_mask_token_id) return true;
         if (this->dflash_n_target_features != other.dflash_n_target_features) return true;
         if (this->dflash_n_target_layers != other.dflash_n_target_layers) return true;
+        if (this->dflash_laguna != other.dflash_laguna) return true;
         if (this->n_layer       != other.n_layer)       return true;
         if (this->n_rot         != other.n_rot)         return true;
         if (this->n_swa         != other.n_swa)         return true;
@@ -383,3 +394,28 @@ struct llama_hparams {
 };
 
 static_assert(std::is_trivially_copyable<llama_hparams>::value, "llama_hparams must be trivially copyable");
+
+// sinks + retained window + one u-batch, padded as one sum so the total is pad-aligned for any
+// sink_rows; compaction then fires every C - W tokens, and the slack floor keeps a small u-batch from compacting every few tokens
+static inline uint32_t llama_swa_compact_rows(uint32_t window, uint32_t pad, uint32_t n_ubatch,
+                                              uint32_t sink_rows) {
+    const uint32_t min_slack = 256;
+    const uint32_t slack     = n_ubatch > min_slack ? n_ubatch : min_slack;
+    const uint32_t unpadded  = sink_rows + window + slack;
+    return pad > 1 ? ((unpadded + pad - 1)/pad)*pad : unpadded;
+}
+
+static inline uint32_t llama_kv_layer_rows(const llama_hparams & hparams, int il, uint32_t kv_size,
+                                           bool swa_compress, uint32_t n_ubatch, uint32_t pad) {
+    if (!swa_compress || il < 0 || il >= (int) hparams.n_layer) {
+        return kv_size;
+    }
+    if (il >= (int) (hparams.n_layer - hparams.nextn_predict_layers)) {
+        return kv_size;
+    }
+    if (!hparams.swa_layers[il]) {
+        return kv_size;
+    }
+    const uint32_t rows = llama_swa_compact_rows(hparams.n_swa, pad, n_ubatch, hparams.param_sink_number);
+    return rows < kv_size ? rows : kv_size;
+}

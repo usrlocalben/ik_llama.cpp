@@ -219,6 +219,10 @@ if (GGML_IQK_MUL_MAT)
     endif()
 endif()
 
+if (GGML_EXPERT_CHUNKING)
+    add_compile_definitions(GGML_EXPERT_CHUNKING)
+endif()
+
 if (GGML_CUDA)
     cmake_minimum_required(VERSION 3.18)  # for CMAKE_CUDA_ARCHITECTURES
 
@@ -1100,11 +1104,11 @@ if (CMAKE_OSX_ARCHITECTURES      STREQUAL "arm64" OR
         if (GGML_SVE)
             list(APPEND ARCH_FLAGS -march=armv8.6-a+sve)
         endif()
-        if (GGML_NATIVE)
-            list(APPEND ARCH_FLAGS -march=native)
-        endif()
         if (CMAKE_CXX_COMPILER_ID MATCHES "GNU")
             # else we fail on Gravitons and such
+            if (GGML_NATIVE)
+                list(APPEND ARCH_FLAGS -march=native)
+            endif()
             list(APPEND ARCH_FLAGS -flax-vector-conversions)
         endif()
     endif()
@@ -1301,6 +1305,8 @@ add_library(ggml
             ggml-moe-prefetch.h
             ggml-quants.c
             ggml-quants.h
+            ggml-utils.h
+            ggml-impl.h
             ${GGML_SOURCES_CUDA}      ${GGML_HEADERS_CUDA}
             ${GGML_SOURCES_METAL}     ${GGML_HEADERS_METAL}
             ${GGML_SOURCES_RPC}       ${GGML_HEADERS_RPC}
